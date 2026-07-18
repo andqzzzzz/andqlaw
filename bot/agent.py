@@ -3,84 +3,25 @@ import re
 import json
 import requests
 import logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
+from datetime import datetime
 from .tools import Tools
 
 logger = logging.getLogger(__name__)
 
 
-def load_system_prompt() -> str:
-    """Загружает системный промт из файла"""
-    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    paths_to_try = [
-        os.path.join(script_dir, "system_prompt.txt"),
-        os.path.join(script_dir, "conversations", "system_prompt.txt"),
-        "system_prompt.txt",
-    ]
-    for path in paths_to_try:
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    logger.info(f"✅ Системный промт загружен из {path}")
-                    return f.read()
-            except Exception as e:
-                logger.warning(f"Не удалось прочитать {path}: {e}")
-                continue
-    logger.error("❌ Файл system_prompt.txt не найден!")
-    return """Ты — ANDQ Bot, корпоративный ИИ-ассистент.
-
-## ТВОЯ РОЛЬ:
-Ты помогаешь сотрудникам отдела зарплаты и кадров. Ты вежливый, дружелюбный и отвечаешь кратко.
-
-## ФОРМАТ ОТВЕТА:
-1. Если пользователь просит выполнить действие — отвечай ТОЛЬКО JSON:
-   {"tool": "имя_инструмента", "params": {"параметр": "значение"}}
-
-2. Если пользователь просто общается — отвечай обычным текстом (без JSON)
-
-## ДОСТУПНЫЕ ИНСТРУМЕНТЫ:
-- list_files: показать файлы в песочнице (params: {})
-- read_file: прочитать файл (params: {"filename": "имя"})
-- write_file: создать/перезаписать файл (params: {"filename": "имя", "content": "текст"})
-- delete_file: удалить файл (params: {"filename": "имя", "confirm": "no"})
-- create_folder: создать папку (params: {"folder_name": "имя"})
-- get_disk_usage: показать место на диске (params: {})
-- list_processes: показать запущенные процессы (params: {})
-- read_log_file: показать логи (params: {})
-- run_sql_query: выполнить SQL запрос (params: {"query": "SELECT..."})
-
-## ПРИМЕРЫ:
-Пользователь: привет
-Ты: Привет! Я ANDQ Bot. Чем могу помочь?
-
-Пользователь: покажи файлы
-Ты: {"tool": "list_files", "params": {}}
-
-Пользователь: создай файл test.txt с текстом привет
-Ты: {"tool": "write_file", "params": {"filename": "test.txt", "content": "привет"}}
-
-Пользователь: сколько места на диске?
-Ты: {"tool": "get_disk_usage", "params": {}}
-
-Пользователь: удали файл test.txt
-Ты: {"tool": "delete_file", "params": {"filename": "test.txt", "confirm": "no"}}
-
-## ВАЖНО:
-- Для list_files, get_disk_usage, list_processes, read_log_file параметры ВСЕГДА {}
-- Для delete_file ВСЕГДА используй confirm: "no"
-- Отвечай ТОЛЬКО JSON или ТОЛЬКО текстом. Без смешивания.
-"""
-
-
 class AndqBotAgent(Tools):
-    """Агент, который всегда использует LLM для принятия решений"""
+    """
+    Агент с двухшаговой LLM-логикой:
+    1. Шаг: LLM структурирует сырые данные
+    2. Шаг: Исполнение решения LLM
+    """
     
     def __init__(self, model_name: str = "qwen2.5-coder-7b-instruct-128k", 
                  lm_studio_url: str = "http://localhost:1234/v1"):
         super().__init__()
         self.model_name = model_name
         self.lm_studio_url = lm_studio_url
-        self.system_prompt = load_system_prompt()
         self.pending_delete = None
         
         try:
@@ -92,15 +33,97 @@ class AndqBotAgent(Tools):
         except Exception as e:
             logger.warning(f"⚠️ LM Studio не отвечает: {e}")
     
-    def _call_lm_studio(self, prompt: str, temperature: float = 0.3, max_tokens: int = 300) -> str:
-        """Вызов модели через LM Studio с системным промтом"""
+    def _get_structurator_prompt(self, raw_data: str) -> str:
+        """Возвращает промпт для структуратора данных"""
+        return f"""Ты — структуратор запросов для ANDQ Bot.
+
+## ТВОЯ ЗАДАЧА:
+Проанализировать ТЕКУЩИЙ запрос пользователя и определить, что он хочет.
+
+## ВХОДНЫЕ ДАННЫЕ:
+{raw_data}
+
+## ОПРЕДЕЛИ ИНТЕНШН ПО ТЕКУЩЕМУ ЗАПРОСУ:
+
+ВНИМАТЕЛЬНО посмотри на "ЗАПРОС ПОЛЬЗОВАТЕЛЯ"!
+
+### ВОТ ТОЧНЫЕ ПРИЗНАКИ:
+
+1. **greeting** - только если запрос содержит ТОЛЬКО:
+   - "привет", "привет!", "здравствуй", "hello", "hi"
+   - НЕ содержит слов "покажи", "создай", "удали", "сколько", "какой"
+
+2. **question** - если запрос содержит:
+   - Вопросительные слова: "сколько", "какой", "какая", "какие", "кто", "что", "где", "когда", "почему", "зачем", "как"
+   - Или знак "?" в конце
+
+3. **action** - если запрос содержит:
+   - "покажи", "посмотри", "список", "найди" → list_files
+   - "создай", "запиши" → write_file или create_folder
+   - "удали", "удалить", "стереть" → delete_file
+   - "прочитай", "открой" → read_file
+   - "сколько места", "диск" → get_disk_usage
+   - "процессы" → list_processes
+   - "логи" → read_log_file
+   - "sql", "запрос" → run_sql_query
+
+## ПРИМЕРЫ ПРАВИЛЬНОГО ОПРЕДЕЛЕНИЯ:
+
+| Запрос | Intent | Инструмент |
+|--------|--------|------------|
+| привет | greeting | null |
+| здравствуй | greeting | null |
+| покажи файлы | action | list_files |
+| сколько файлов? | question | null |
+| создай папку test | action | create_folder |
+| удали test.txt | action | delete_file |
+| сколько места на диске? | question | null (это вопрос, а не команда!) |
+
+## ВЫХОДНОЙ JSON:
+{{
+  "clean_context": "краткая суть диалога",
+  "current_intent": "greeting | question | action | confirmation | unknown",
+  "action_tool": "имя_инструмента или null",
+  "action_params": {{}} или {{"param": "value"}},
+  "response_text": "текст для greeting/question, иначе null",
+  "needs_confirmation": false,
+  "confidence": 0.0-1.0,
+  "summary": "1 предложение о запросе"
+}}
+
+## ВАЖНО:
+1. СНАЧАЛА посмотри на ТЕКУЩИЙ ЗАПРОС!
+2. НЕ путай с историей!
+3. "сколько" - это ВСЕГДА вопрос, а не действие!
+4. Если запрос содержит "покажи" - это action!
+5. Отвечай ТОЛЬКО JSON!
+"""
+    
+    def _clean_text(self, text: str) -> str:
+        """Очищает текст от битых символов и мусора"""
+        if not text:
+            return ""
+        
+        try:
+            text = text.encode('utf-8', errors='ignore').decode('utf-8')
+        except:
+            text = ""
+        
+        text = re.sub(r'<\|[^>]+\|>', '', text)
+        text = re.sub(r'```[a-z]*\n?', '', text)
+        text = re.sub(r'[^\x00-\x7F\x80-\xFF\u0400-\u04FF\n.,!?\-:;()"\' ]', '', text)
+        
+        return text.strip()
+    
+    def _call_lm_studio(self, prompt: str, temperature: float = 0.1, max_tokens: int = 300) -> str:
+        """Вызов модели через LM Studio"""
         try:
             response = requests.post(
                 f"{self.lm_studio_url}/chat/completions",
                 json={
                     "model": self.model_name,
                     "messages": [
-                        {"role": "system", "content": self.system_prompt},
+                        {"role": "system", "content": "Ты — структуратор запросов. Отвечай ТОЛЬКО JSON. Не используй Markdown."},
                         {"role": "user", "content": prompt}
                     ],
                     "temperature": temperature,
@@ -112,7 +135,8 @@ class AndqBotAgent(Tools):
             response.raise_for_status()
             result = response.json()
             content = result["choices"][0]["message"]["content"]
-            return content.strip()
+            clean_content = self._clean_text(content)
+            return clean_content
         except Exception as e:
             logger.error(f"❌ Ошибка вызова LM Studio: {e}")
             return ""
@@ -122,8 +146,9 @@ class AndqBotAgent(Tools):
         if not text:
             return None
         
-        # Очищаем от маркеров кода
-        clean = text.strip()
+        clean = self._clean_text(text)
+        
+        # Удаляем маркеры кода
         if clean.startswith("```json"):
             clean = clean[7:]
         if clean.startswith("```"):
@@ -132,7 +157,7 @@ class AndqBotAgent(Tools):
             clean = clean[:-3]
         clean = clean.strip()
         
-        # Ищем JSON с учетом вложенности
+        # Ищем JSON
         brace_count = 0
         start = -1
         
@@ -147,49 +172,66 @@ class AndqBotAgent(Tools):
                     try:
                         json_str = clean[start:i+1]
                         result = json.loads(json_str)
-                        if isinstance(result, dict) and "tool" in result:
-                            return result
+                        return result
                     except json.JSONDecodeError:
                         continue
         
-        # Если не нашли, пробуем простой поиск
         match = re.search(r'\{[^{}]*\}', clean)
         if match:
             try:
-                result = json.loads(match.group())
-                if isinstance(result, dict) and "tool" in result:
-                    return result
+                return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
         
         return None
     
+    def _collect_raw_data(self, user_prompt: str, context: str = "", files_info: str = "") -> Dict:
+        """Собирает все сырые данные"""
+        return {
+            "user_query": user_prompt,
+            "context": context if context else "(контекст пуст)",
+            "files": files_info if files_info else "(информация о файлах не запрашивалась)",
+            "pending_delete": self.pending_delete if self.pending_delete else "нет",
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def _format_raw_data(self, raw_data: Dict) -> str:
+        """Форматирует сырые данные"""
+        formatted = "=== ТЕКУЩИЙ ЗАПРОС ===\n"
+        formatted += f"{raw_data.get('user_query', '')}\n\n"
+        
+        formatted += "=== ИСТОРИЯ ДИАЛОГА ===\n"
+        formatted += f"{raw_data.get('context', '')}\n\n"
+        
+        if raw_data.get('files') and raw_data.get('files') != "(информация о файлах не запрашивалась)":
+            formatted += "=== ФАЙЛЫ ===\n"
+            formatted += f"{raw_data.get('files')}\n"
+        
+        return formatted
+    
     def _is_confirmation(self, text: str) -> bool:
-        """Проверяет, является ли текст подтверждением"""
         if not text:
             return False
-        confirm_words = ['да', 'yes', 'confirm', 'подтверждаю', 'конечно', 'ок', 'ok']
-        return text.lower().strip() in confirm_words
+        text = text.lower().strip()
+        return text in ['да', 'yes', 'confirm', 'подтверждаю', 'конечно', 'ок', 'ok', 'да.']
     
     def _is_cancellation(self, text: str) -> bool:
-        """Проверяет, является ли текст отменой"""
         if not text:
             return False
-        cancel_words = ['нет', 'no', 'cancel', 'отмена', 'не надо']
-        return text.lower().strip() in cancel_words
+        text = text.lower().strip()
+        return text in ['нет', 'no', 'cancel', 'отмена', 'не надо', 'нет.']
     
     def think_and_act(self, user_prompt: str, context: str = "") -> str:
         """
-        Основная логика: ВСЕГДА отправляем запрос в LLM
+        Основная логика: двухшаговый подход
         """
         logger.info(f"📝 Запрос: {user_prompt}")
         
-        # Проверка подтверждения удаления
+        # Проверка подтверждения/отмены
         if self.pending_delete:
             if self._is_confirmation(user_prompt):
                 filename = self.pending_delete
                 self.pending_delete = None
-                logger.info(f"✅ Подтверждено удаление: {filename}")
                 try:
                     result = self.delete_file(filename, confirm="yes")
                     return result
@@ -200,80 +242,89 @@ class AndqBotAgent(Tools):
                 self.pending_delete = None
                 return f"✅ Удаление файла '{filename}' отменено."
         
-        # Формируем промт
-        prompt = f"""
-        {f'Контекст диалога:\n{context}' if context else ''}
+        # Сбор данных
+        if len(context) > 3000:
+            context = context[:3000] + "..."
         
-        Запрос пользователя: "{user_prompt}"
+        files_info = ""
+        try:
+            files_info = self.list_files()
+        except:
+            files_info = "(ошибка получения списка файлов)"
         
-        ОТВЕТЬ ТОЛЬКО:
-        - JSON если нужно действие
-        - Текст если это разговор
-        """
+        raw_data = self._collect_raw_data(user_prompt, context, files_info)
+        formatted_raw = self._format_raw_data(raw_data)
         
-        logger.info(f"📤 Промт к LLM (первые 300 символов):\n{prompt[:300]}...")
+        logger.info(f"📊 Сырых данных: {len(formatted_raw)} символов")
         
-        # ВСЕГДА вызываем LLM
-        response = self._call_lm_studio(prompt, temperature=0.3, max_tokens=300)
+        # LLM структурирует
+        structurator_prompt = self._get_structurator_prompt(formatted_raw)
+        
+        logger.info(f"🧠 Отправляем в LLM...")
+        response = self._call_lm_studio(structurator_prompt, temperature=0.1, max_tokens=300)
         
         if not response:
-            return "Извините, произошла ошибка при обращении к модели."
+            return "Извините, произошла ошибка при анализе запроса."
         
-        logger.info(f"📥 Сырой ответ LLM: {response[:200]}...")
+        logger.info(f"📥 Ответ: {response[:200]}...")
         
-        # Пробуем извлечь JSON
-        json_data = self._extract_json(response)
+        # Парсим JSON
+        structured_data = self._extract_json(response)
         
-        if json_data and "tool" in json_data:
-            tool_name = json_data.get("tool")
-            params = json_data.get("params", {})
+        if not structured_data:
+            logger.error(f"❌ Не удалось извлечь JSON")
+            return "Извините, я не смог обработать запрос."
+        
+        logger.info(f"📊 Intent: {structured_data.get('current_intent')}, Tool: {structured_data.get('action_tool')}, Confidence: {structured_data.get('confidence')}")
+        
+        intent = structured_data.get('current_intent', 'unknown')
+        confidence = structured_data.get('confidence', 0.0)
+        
+        if confidence < 0.5:
+            return f"⚠️ Я не уверен (уверенность: {confidence:.0%}).\n{structured_data.get('response_text', 'Попробуйте переформулировать.')}"
+        
+        if intent == 'greeting':
+            return structured_data.get('response_text', 'Привет! Чем могу помочь?')
+        
+        elif intent == 'question':
+            return structured_data.get('response_text', 'Я не нашел ответа.')
+        
+        elif intent == 'action':
+            tool_name = structured_data.get('action_tool')
+            params = structured_data.get('action_params', {})
             
-            logger.info(f"🔧 LLM выбрала инструмент: {tool_name} с параметрами: {params}")
+            if not tool_name:
+                return "Извините, не удалось определить действие."
             
-            # Проверяем существование инструмента
             if not hasattr(self, tool_name):
                 return f"❌ Инструмент '{tool_name}' не найден."
             
-            # Очищаем params для инструментов без параметров
             no_params_tools = ['list_files', 'get_disk_usage', 'list_processes', 'read_log_file']
             if tool_name in no_params_tools:
                 params = {}
-                logger.info(f"🧹 Очищены параметры для {tool_name}")
             
-            # Обработка удаления
-            if tool_name == "delete_file":
-                filename = params.get("filename")
+            if tool_name == 'delete_file':
+                filename = params.get('filename')
                 if not filename:
-                    return "❌ Не указано имя файла для удаления"
-                
-                if params.get("confirm") != "yes":
+                    return "❌ Не указано имя файла"
+                if structured_data.get('needs_confirmation', True):
                     self.pending_delete = filename
-                    return f"⚠️ Для удаления файла '{filename}' введите 'да' для подтверждения или 'нет' для отмены."
+                    return f"⚠️ Удалить '{filename}'? Введите 'да' или 'нет'"
             
-            # Выполняем инструмент
             try:
-                logger.info(f"⚙️ Выполняю {tool_name} с параметрами: {params}")
+                logger.info(f"⚙️ Выполняю {tool_name} с {params}")
                 result = getattr(self, tool_name)(**params)
-                
                 if isinstance(result, str) and len(result) > 500:
                     result = result[:500] + "..."
-                
                 return result
-            except TypeError as e:
-                logger.error(f"❌ Ошибка параметров: {e}")
-                return f"⚠️ Ошибка: неверные параметры для {tool_name}"
             except Exception as e:
-                logger.error(f"❌ Ошибка выполнения {tool_name}: {e}")
                 return f"❌ Ошибка: {str(e)}"
         
-        # Если это не JSON - возвращаем как текстовый ответ
-        logger.info(f"💬 Текстовый ответ от LLM")
-        return response
+        else:
+            return structured_data.get('response_text', 'Не понял запрос.')
     
     def clear_pending_delete(self) -> None:
-        """Очищает состояние ожидающего удаления"""
         self.pending_delete = None
     
     def get_pending_delete(self) -> Optional[str]:
-        """Возвращает имя файла, ожидающего подтверждения удаления"""
         return self.pending_delete

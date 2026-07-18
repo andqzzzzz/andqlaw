@@ -1,140 +1,98 @@
-import json
 import os
+import json
 import logging
 from datetime import datetime
-from typing import Dict
+from typing import List, Dict
 
 logger = logging.getLogger(__name__)
 
 
 class ContextManager:
-    """Управление контекстом с защитой от битых файлов"""
+    """
+    Управление контекстом диалога.
+    Теперь просто хранит сырые данные, а структурирует их LLM.
+    """
     
-    def __init__(self, conv_dir="conversations", max_chars=2000):
-        self.conv_dir = conv_dir
-        self.history_dir = os.path.join(conv_dir, "history")
-        self.state_file = os.path.join(conv_dir, "current_state.json")
-        self.max_chars = max_chars
+    def __init__(self, context_dir: str = "conversations", max_messages: int = 20):
+        self.context_dir = context_dir
+        self.max_messages = max_messages
+        self.state_file = os.path.join(context_dir, "current_state.json")
+        self.history_dir = os.path.join(context_dir, "history")
         
+        os.makedirs(context_dir, exist_ok=True)
         os.makedirs(self.history_dir, exist_ok=True)
-        os.makedirs(conv_dir, exist_ok=True)
         
-        # Создаём файл, если его нет
-        if not os.path.exists(self.state_file):
-            self._save_state({"context": "", "last_response": "", "timestamp": ""})
+        self.state = self._load_state()
     
-    def _load_state(self) -> Dict:
-        """Загружает состояние, создаёт новое, если файл битый или пустой"""
-        try:
-            with open(self.state_file, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if not content:
-                    raise ValueError("Файл пустой")
-                return json.loads(content)
-        except (json.JSONDecodeError, ValueError, FileNotFoundError) as e:
-            logger.warning(f"⚠️ Ошибка загрузки контекста: {e}. Создаю новый.")
-            default_state = {"context": "", "last_response": "", "timestamp": ""}
-            self._save_state(default_state)
-            return default_state
-    
-    def _save_state(self, data: Dict):
-        with open(self.state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    
-    def _save_history(self, state: Dict):
-        filename = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
-        path = os.path.join(self.history_dir, filename)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    
-    def _summarize_response(self, response: str, max_len: int = 150) -> str:
-        """Сжимает ответ до краткого резюме"""
-        if not response:
+    def _clean_text(self, text: str) -> str:
+        """Базовая очистка текста"""
+        if not text:
             return ""
-        
-        # Убираем эмодзи и лишние переносы
-        clean = response.replace('\n', ' ').strip()
-        
-        # Если ответ короче лимита — возвращаем как есть
-        if len(clean) <= max_len:
-            return clean
-        
-        # Ищем ключевую информацию
-        lines = response.split('\n')
-        summary_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # Пропускаем строки с большими блоками данных
-            if len(line) > 80:
-                continue
-            # Пропускаем строки, похожие на данные процессов или таблиц
-            if any(x in line for x in ['ЉЃ', 'КБ', 'МБ', '.exe', '.txt', 'PID', 'Total']):
-                continue
-            if len(summary_lines) < 3:
-                summary_lines.append(line)
-        
-        if summary_lines:
-            result = ' '.join(summary_lines)
-            if len(result) <= max_len:
-                return result
-            return result[:max_len] + "..."
-        
-        # Если не удалось извлечь ключевую информацию — просто обрезаем
-        return clean[:max_len] + "..."
+        text = text.encode('utf-8', errors='ignore').decode('utf-8')
+        return text.strip()
     
-    def get_context(self, user_query: str) -> str:
-        """Возвращает сжатый контекст для LLM"""
-        state = self._load_state()
-        old_context = state.get("context", "")
-        last_response = state.get("last_response", "")
+    def _load_state(self) -> dict:
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if "messages" not in data:
+                        data["messages"] = []
+                    return data
+            except Exception as e:
+                logger.warning(f"Не удалось загрузить состояние: {e}")
         
-        # Собираем контекст
-        full_context = f"{old_context}\n\nПоследний ответ: {last_response}\n\nНовый запрос: {user_query}"
-        
-        # Ограничиваем размер
-        if len(full_context) > self.max_chars:
-            # Берём последнюю половину
-            compressed = old_context[-(self.max_chars // 2):] if len(old_context) > self.max_chars // 2 else old_context
-            full_context = f"{compressed}\n\nПоследний ответ: {last_response}\n\nНовый запрос: {user_query}"
-        
-        logger.info(f"📊 Размер контекста: {len(full_context)} символов")
-        return full_context
+        return {"messages": [], "last_updated": datetime.now().isoformat()}
     
-    def save_response(self, user_query: str, bot_response: str, raw_result: str = ""):
+    def _save_state(self) -> None:
+        try:
+            self.state["last_updated"] = datetime.now().isoformat()
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Не удалось сохранить состояние: {e}")
+    
+    def _save_history(self) -> None:
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            history_file = os.path.join(self.history_dir, f"{timestamp}.json")
+            with open(history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Не удалось сохранить историю: {e}")
+    
+    def get_context(self, user_prompt: str) -> str:
         """
-        Сохраняет ответ в контекст с сжатием
-        
-        Аргументы:
-            user_query: запрос пользователя
-            bot_response: финальный ответ бота (уже человекочитаемый)
-            raw_result: сырой результат от инструмента (для сжатия)
+        Возвращает СЫРУЮ историю диалога.
+        Вся структуризация будет делаться LLM.
         """
-        old_state = self._load_state()
-        self._save_history(old_state)
+        messages = self.state.get("messages", [])
         
-        # Если есть сырой результат — сжимаем его
-        if raw_result:
-            summary = self._summarize_response(raw_result)
-            context_entry = f"Пользователь: {user_query} → {summary}"
-        else:
-            # Если нет сырого результата — сжимаем сам ответ
-            summary = self._summarize_response(bot_response)
-            context_entry = f"Пользователь: {user_query} → {summary}"
+        if not messages:
+            return "Диалог только начинается."
         
-        # Добавляем к существующему контексту
-        new_context = f"{old_state.get('context', '')}\n{context_entry}".strip()
+        history_lines = []
+        for msg in messages[-self.max_messages:]:
+            role = "Пользователь" if msg["role"] == "user" else "Ассистент"
+            content = self._clean_text(msg["content"])
+            if content:
+                history_lines.append(f"{role}: {content}")
         
-        # Ограничиваем размер
-        if len(new_context) > self.max_chars:
-            # Берём последние self.max_chars символов
-            new_context = new_context[-self.max_chars:]
+        return "\n".join(history_lines)
+    
+    def save_response(self, user_prompt: str, response: str) -> None:
+        """Сохраняет диалог"""
+        self._save_history()
         
-        self._save_state({
-            "context": new_context,
-            "last_response": self._summarize_response(bot_response, max_len=100),
-            "last_query": user_query,
-            "timestamp": datetime.now().isoformat()
-        })
+        messages = self.state.get("messages", [])
+        
+        messages.append({"role": "user", "content": user_prompt})
+        messages.append({"role": "assistant", "content": response[:1000]})
+        
+        if len(messages) > self.max_messages * 2:
+            messages = messages[-self.max_messages * 2:]
+        
+        self.state["messages"] = messages
+        self._save_state()
+        
+        logger.info(f"📊 Сообщений в истории: {len(messages)}")
