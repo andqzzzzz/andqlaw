@@ -1,0 +1,40 @@
+# Виртуальное окружение
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Логи и данные
+logs/
+conversations/
+sandbox/
+current_state.json
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Файлы с секретами
+*.env
+*.secret
+config_local.py
+
+# Временные файлы
+*.tmp
+*.bak
+*.orig
